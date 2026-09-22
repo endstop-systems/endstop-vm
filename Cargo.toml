@@ -1,0 +1,25 @@
+[package]
+name = "endstop-vm"
+version = "0.1.0"
+edition = "2021"
+description = "A fuel-bounded interpreter for an admitted eBPF subset."
+license = "BUSL-1.1"
+repository = "https://github.com/endstop-systems/endstop-vm"
+
+# `kani` is a cfg the model checker sets, not a Cargo feature. Declaring it
+# here stops rustc warning about an unexpected cfg name on every build, which
+# on a published crate is the first thing a reader sees.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lib]
+crate-type = ["rlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+overflow-checks = true
+
+[profile.dev]
+overflow-checks = true

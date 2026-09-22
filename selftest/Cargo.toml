@@ -1,0 +1,22 @@
+[package]
+name = "endstop-vm-selftest"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+description = "Runs endstop-vm on a real RV32 core model and prints what happened."
+
+[dependencies]
+endstop-vm = { path = ".." }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+overflow-checks = true
+
+[profile.dev]
+panic = "abort"
+overflow-checks = true
