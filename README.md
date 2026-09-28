@@ -4,9 +4,8 @@ A small Rust interpreter for an admitted eBPF subset, with load-time validation,
 bounds-checked scratch memory, a fixed capability table, and instruction fuel.
 The library uses `no_std`, has no allocator, and forbids unsafe Rust.
 
-This repository restores the previously published VM snapshot as one initial
-commit. It contains the interpreter, validator, host tests, Kani proof harnesses,
-and a RISC-V self-test. The separate envelope monitor and hardware integration
+It contains the interpreter, validator, timing-cost table, host tests, Kani
+proof harnesses, and a RISC-V self-test. The separate envelope monitor and hardware integration
 are outside this repository.
 
 ## Run the host tests
@@ -42,10 +41,12 @@ With Kani installed:
 cargo kani
 ```
 
-The six harnesses in `src/proofs.rs` cover single-instruction memory safety,
+The seven harnesses in `src/proofs.rs` cover single-instruction memory safety,
 capability-index validation, jump-target validation, forward-only validation,
-checked memory accesses, and fuel exhaustion. Each harness states its unwind
-bound. These are bounded checks: the single-instruction harness starts from the
+checked memory accesses, step-fuel exhaustion, and prepaid timing credits (an
+instruction whose complete charge cannot be paid does not execute, so an
+unfunded capability call never enters the callee). Each harness states its
+unwind bound. These are bounded checks: the single-instruction harness starts from the
 VM's reset state, and the results do not establish arbitrary-state safety or
 source-to-machine-code refinement. Capability implementations remain the
 integrator's responsibility.
@@ -57,6 +58,7 @@ integrator's responsibility.
 | `src/isa.rs` | Instruction encoding and admitted opcodes |
 | `src/loader.rs` | Program validation |
 | `src/lib.rs` | Machine state and execution |
+| `src/costs.rs` | Versioned per-instruction timing-credit table for the NEORV32 target |
 | `src/tests.rs` | Host regression tests |
 | `src/proofs.rs` | Bounded Kani proof harnesses |
 | `selftest/` | RISC-V executable and QEMU configuration |

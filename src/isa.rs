@@ -96,7 +96,7 @@ pub const SIZE_B: u8 = 0x10;
 ///
 /// The whitelist is positive: an opcode is rejected unless it appears here.
 /// A negative list would silently admit anything a future encoding adds.
-pub fn admitted(opcode: u8) -> bool {
+pub const fn admitted(opcode: u8) -> bool {
     let class = opcode & 0x07;
     let op = opcode & 0xf0;
     let src = opcode & 0x08;
@@ -105,8 +105,17 @@ pub fn admitted(opcode: u8) -> bool {
         // 32-bit-valued, so a 64-bit operation has no meaning here.
         CLASS_ALU => matches!(
             op,
-            ALU_ADD | ALU_SUB | ALU_MUL | ALU_OR | ALU_AND | ALU_LSH | ALU_RSH
-                | ALU_NEG | ALU_XOR | ALU_MOV | ALU_ARSH
+            ALU_ADD
+                | ALU_SUB
+                | ALU_MUL
+                | ALU_OR
+                | ALU_AND
+                | ALU_LSH
+                | ALU_RSH
+                | ALU_NEG
+                | ALU_XOR
+                | ALU_MOV
+                | ALU_ARSH
         ),
         CLASS_JMP => match op {
             JMP_JA => src == SRC_IMM,

@@ -17,66 +17,61 @@ use crate::{MAX_INSNS, N_CAPS};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reject {
     Empty,
-    TooLong { len: usize },
-    IllegalOpcode { at: usize },
+    TooLong {
+        len: usize,
+    },
+    IllegalOpcode {
+        at: usize,
+    },
     /// A jump that does not move strictly forwards. Only reachable under
     /// [`Strictness::ForwardOnly`]; loops are admitted by default because
     /// fuel already bounds them.
-    BackwardJump { at: usize, off: i16 },
-    JumpOutOfRange { at: usize },
-    BadRegister { at: usize },
-    BadCapIndex { at: usize, idx: i32 },
+    BackwardJump {
+        at: usize,
+        off: i16,
+    },
+    JumpOutOfRange {
+        at: usize,
+    },
+    BadRegister {
+        at: usize,
+    },
+    BadCapIndex {
+        at: usize,
+        idx: i32,
+    },
     /// The last instruction must be `exit`, so falling off the end is
     /// impossible rather than merely unlikely.
     NoTrailingExit,
+    /// Conservative sum of all forward-only instruction charges exceeds the
+    /// target-specific allowance supplied by the scheduler.
+    TickBudgetExceeded {
+        required: u64,
+        available: u32,
+    },
 }
 
-/// The two bounds a caller needs, kept apart because conflating them is easy
-/// and the failure is silent.
+/// A forward-only program admitted against one concrete timing model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Bounds {
-    /// Steps after which the program has provably finished: its own length,
-    /// since forward-only jumps mean no instruction executes twice. This is
-    /// the **termination** argument.
-    pub termination: u32,
-    /// Steps the tick can afford. A different question entirely — it is about
-    /// the control period, not about the program — and it is the smaller of
-    /// the two in any realistic configuration.
-    pub work_budget: u32,
+pub struct Admission {
+    pub instructions: u32,
+    pub required_credits: u32,
+    pub cost_model_version: u32,
 }
 
-impl Bounds {
-    /// The fuel to actually pass to [`crate::Vm::run`].
-    ///
-    /// A program may be shorter than the tick allows, in which case
-    /// termination binds. A program may be longer, in which case the tick
-    /// binds and the program is cut off mid-flight — which is safe, because
-    /// an abort drives the safe state, but which the operator should see as
-    /// a configuration error rather than normal operation.
-    #[inline]
-    pub fn fuel(&self) -> u32 {
-        if self.termination < self.work_budget {
-            self.termination
-        } else {
-            self.work_budget
-        }
-    }
-
-    /// True when the tick budget, not the program, is what will stop it.
-    /// Worth surfacing at load time: a program that cannot finish inside a
-    /// tick will be aborted every tick, forever.
-    #[inline]
-    pub fn work_bound_binds(&self) -> bool {
-        self.work_budget < self.termination
+impl Admission {
+    /// The smallest budget that is sufficient under the admitted model.
+    pub const fn execution_budget(self) -> crate::ExecutionBudget {
+        crate::ExecutionBudget::new(
+            crate::StepFuel::new(self.instructions),
+            crate::TickCredits::new(self.required_credits),
+        )
     }
 }
 
 /// Validate an image. Returns the **termination** bound, which is not the
-/// same number as the tick's fuel budget — see [`Bounds`].
+/// same kind of number as target-specific tick credits.
 ///
-/// The order matters: length before anything indexed, opcodes before their
-/// operands are interpreted, and jump targets last, since they depend on the
-/// length already being known.
 /// How strictly to validate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Strictness {
@@ -98,7 +93,8 @@ pub enum Strictness {
 /// the program provably finishes in a bounded number of steps *derived from the
 /// program*; under [`Strictness::Default`] loops are admitted, so there is no
 /// such syntactic bound and the fuel cap is the only limit. A caller that wants
-/// "the fuel to run with" must ask for it explicitly via [`Termination::fuel`],
+/// a dispatch bound must ask for it explicitly via
+/// [`Termination::step_fuel`],
 /// which makes the constant-vs-derived choice visible at the call site rather
 /// than hidden behind a bare `u32`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,14 +107,14 @@ pub enum Termination {
 }
 
 impl Termination {
-    /// The fuel to actually pass to [`crate::Vm::run`]: the derived length when
-    /// that is a real bound, otherwise the global fuel cap. Named so the choice
-    /// is deliberate at the call site.
+    /// Platform-independent dispatch bound: the derived length when that is a
+    /// real bound, otherwise the global proof ceiling. Tick credits must be
+    /// supplied separately by the scheduler.
     #[inline]
-    pub fn fuel(self) -> u32 {
+    pub fn step_fuel(self) -> crate::StepFuel {
         match self {
-            Termination::Length(n) => n,
-            Termination::FuelBounded => crate::MAX_FUEL,
+            Termination::Length(n) => crate::StepFuel::new(n),
+            Termination::FuelBounded => crate::StepFuel::new(crate::MAX_STEP_FUEL),
         }
     }
 }
@@ -126,6 +122,36 @@ impl Termination {
 /// Validate an image at the default strictness.
 pub fn validate(insns: &[Insn]) -> Result<Termination, Reject> {
     validate_with(insns, Strictness::Default)
+}
+
+/// Admit a program for completion within one modelled control-tick allowance.
+///
+/// This deliberately requires [`Strictness::ForwardOnly`]. With no repeated
+/// instruction, summing every instruction in the image is conservative even
+/// across conditional paths (it may count mutually exclusive paths, but never
+/// under-counts an executed path). Looping programs retain safe termination
+/// through step fuel, but do not receive a completion-within-tick admission.
+pub fn validate_for_tick(
+    insns: &[Insn],
+    costs: &crate::CostModel,
+    available: crate::TickCredits,
+) -> Result<Admission, Reject> {
+    validate_with(insns, Strictness::ForwardOnly)?;
+    let mut required = costs.run_overhead() as u64;
+    for insn in insns {
+        required += costs.charge(insn) as u64;
+    }
+    if required > available.get() as u64 {
+        return Err(Reject::TickBudgetExceeded {
+            required,
+            available: available.get(),
+        });
+    }
+    Ok(Admission {
+        instructions: insns.len() as u32,
+        required_credits: required as u32,
+        cost_model_version: costs.version,
+    })
 }
 
 /// Validate an image.
@@ -190,7 +216,7 @@ pub fn validate_with(insns: &[Insn], strict: Strictness) -> Result<Termination, 
 
     // Under ForwardOnly no instruction executes twice, so the program cannot
     // take more steps than it has instructions. With loops admitted there is
-    // no such bound and termination rests on fuel — `MAX_FUEL`, the number of
+    // no such bound and termination rests on fuel — `MAX_STEP_FUEL`, the number of
     // instructions a run may execute, which is what a program actually gets.
     Ok(match strict {
         Strictness::ForwardOnly => Termination::Length(insns.len() as u32),

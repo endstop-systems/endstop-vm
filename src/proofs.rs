@@ -2,7 +2,7 @@
 //!
 //! The claim the interpreter owes: an untrusted program cannot escape its
 //! memory, cannot fail to terminate, and cannot reach an effect outside the
-//! capability table. All six harnesses discharge under bounded model checking;
+//! capability table. All seven harnesses discharge under bounded model checking;
 //! each states its `unwind` bound below.
 //!
 //! The bounds are shallow -- one to three instructions, against a machine that
@@ -23,6 +23,12 @@ impl Caps for NoCaps {
     fn call(&mut self, _idx: u32, _args: [u32; 5]) -> u32 {
         0
     }
+}
+
+const PROOF_COSTS: CostModel = CostModel::uniform(1);
+
+fn proof_budget(steps: u32, credits: u32) -> ExecutionBudget {
+    ExecutionBudget::new(StepFuel::new(steps), TickCredits::new(credits))
 }
 
 fn any_insn() -> Insn {
@@ -50,7 +56,7 @@ fn v1_single_step_is_memory_safe() {
     // run() re-checks everything the loader established, so an unvalidated
     // program is a legitimate input here — that is the point of the
     // belt-and-braces checks.
-    let _ = vm.run(&prog, 4, &mut NoCaps);
+    let _ = vm.run(&prog, proof_budget(4, 4), &PROOF_COSTS, &mut NoCaps);
     // No explicit assert, and that is the point: panic-freedom *is* the
     // memory-safety obligation here. An out-of-bounds index or an arithmetic
     // overflow panics in safe Rust, so Kani's implicit panic and overflow checks
@@ -66,8 +72,23 @@ fn v1_single_step_is_memory_safe() {
 #[kani::unwind(4)]
 fn v2_capability_index_is_bounded() {
     let imm: i32 = kani::any();
-    let insn = Insn { opcode: CLASS_JMP | JMP_CALL, dst: 0, src: 0, off: 0, imm };
-    let prog = [insn, Insn { opcode: CLASS_JMP | JMP_EXIT, dst: 0, src: 0, off: 0, imm: 0 }];
+    let insn = Insn {
+        opcode: CLASS_JMP | JMP_CALL,
+        dst: 0,
+        src: 0,
+        off: 0,
+        imm,
+    };
+    let prog = [
+        insn,
+        Insn {
+            opcode: CLASS_JMP | JMP_EXIT,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0,
+        },
+    ];
     if validate(&prog).is_ok() {
         assert!(imm >= 0 && (imm as usize) < N_CAPS);
     }
@@ -83,7 +104,13 @@ fn v2_capability_index_is_bounded() {
 #[kani::unwind(4)]
 fn v3_validated_jump_target_is_in_range() {
     let a = any_insn();
-    let exit = Insn { opcode: CLASS_JMP | JMP_EXIT, dst: 0, src: 0, off: 0, imm: 0 };
+    let exit = Insn {
+        opcode: CLASS_JMP | JMP_EXIT,
+        dst: 0,
+        src: 0,
+        off: 0,
+        imm: 0,
+    };
     let prog = [a, exit];
     if validate(&prog).is_ok() && is_jump(a.opcode) {
         let op = a.opcode & 0xf0;
@@ -100,7 +127,13 @@ fn v3_validated_jump_target_is_in_range() {
 #[kani::unwind(4)]
 fn v3b_forward_only_mode_rejects_backward_jumps() {
     let a = any_insn();
-    let exit = Insn { opcode: CLASS_JMP | JMP_EXIT, dst: 0, src: 0, off: 0, imm: 0 };
+    let exit = Insn {
+        opcode: CLASS_JMP | JMP_EXIT,
+        dst: 0,
+        src: 0,
+        off: 0,
+        imm: 0,
+    };
     let prog = [a, exit];
     if validate_with(&prog, Strictness::ForwardOnly).is_ok() && is_jump(a.opcode) {
         let op = a.opcode & 0xf0;
@@ -120,20 +153,27 @@ fn v3b_forward_only_mode_rejects_backward_jumps() {
 #[kani::unwind(9)]
 fn v5_any_program_halts() {
     let a = any_insn();
-    let exit = Insn { opcode: CLASS_JMP | JMP_EXIT, dst: 0, src: 0, off: 0, imm: 0 };
+    let exit = Insn {
+        opcode: CLASS_JMP | JMP_EXIT,
+        dst: 0,
+        src: 0,
+        off: 0,
+        imm: 0,
+    };
     let prog = [a, exit];
     let mut vm = Vm::new();
     // Small fuel keeps the unwind tractable; the argument is independent of
     // the constant, since the loop decrements once per iteration.
-    let h = vm.run(&prog, 8, &mut NoCaps);
+    let h = vm.run(&prog, proof_budget(8, 8), &PROOF_COSTS, &mut NoCaps);
     // The claim is that the loop terminates in a defined halt: its trip count is
     // bounded by the fuel constant, so it cannot run forever. `unwind(9)` over
     // fuel 8 is what proves the bound; this asserts the run ends in a known halt
     // rather than diverging.
     assert!(matches!(
-        h,
+        h.halt,
         Halt::Exit(_)
-            | Halt::FuelExhausted
+            | Halt::StepFuelExhausted
+            | Halt::TickCreditsExhausted
             | Halt::PcOutOfRange
             | Halt::IllegalOpcode
             | Halt::MemBounds
@@ -152,13 +192,75 @@ fn v4_memory_access_is_checked() {
     let size: u8 = kani::any();
     kani::assume(matches!(size, SIZE_W | SIZE_H | SIZE_B));
     let prog = [
-        Insn { opcode: CLASS_ALU | ALU_MOV | SRC_IMM, dst: 1, src: 0, off: 0, imm: base as i32 },
-        Insn { opcode: CLASS_LDX | size, dst: 0, src: 1, off, imm: 0 },
-        Insn { opcode: CLASS_JMP | JMP_EXIT, dst: 0, src: 0, off: 0, imm: 0 },
+        Insn {
+            opcode: CLASS_ALU | ALU_MOV | SRC_IMM,
+            dst: 1,
+            src: 0,
+            off: 0,
+            imm: base as i32,
+        },
+        Insn {
+            opcode: CLASS_LDX | size,
+            dst: 0,
+            src: 1,
+            off,
+            imm: 0,
+        },
+        Insn {
+            opcode: CLASS_JMP | JMP_EXIT,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0,
+        },
     ];
     let mut vm = Vm::new();
     // Either it completes or it reports MemBounds. It must not do anything
     // else, and must not panic.
-    let h = vm.run(&prog, 8, &mut NoCaps);
-    assert!(matches!(h, Halt::Exit(_) | Halt::MemBounds | Halt::WriteToFp));
+    let h = vm.run(&prog, proof_budget(8, 8), &PROOF_COSTS, &mut NoCaps);
+    assert!(matches!(
+        h.halt,
+        Halt::Exit(_) | Halt::MemBounds | Halt::WriteToFp
+    ));
+}
+
+/// **V6** — an instruction is not executed unless its complete timing charge
+/// has been reserved. The capability boundary is the externally observable
+/// case: insufficient credits must leave the call count at zero.
+#[kani::proof]
+#[kani::unwind(3)]
+fn v6_tick_charge_precedes_capability_effect() {
+    struct CountingCaps {
+        calls: u32,
+    }
+    impl Caps for CountingCaps {
+        fn call(&mut self, _idx: u32, _args: [u32; 5]) -> u32 {
+            self.calls += 1;
+            0
+        }
+    }
+
+    let prog = [
+        Insn {
+            opcode: CLASS_JMP | JMP_CALL,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0,
+        },
+        Insn {
+            opcode: CLASS_JMP | JMP_EXIT,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0,
+        },
+    ];
+    let costs = CostModel::new(1, 1, 1, 1, [1; 3], [1; 3], 1, [2; N_CAPS], 1, 1);
+    let mut vm = Vm::new();
+    let mut caps = CountingCaps { calls: 0 };
+    let outcome = vm.run(&prog, proof_budget(2, 2), &costs, &mut caps);
+    assert!(matches!(outcome.halt, Halt::TickCreditsExhausted));
+    assert!(outcome.steps_used == 0 && outcome.credits_used == 1);
+    assert!(caps.calls == 0);
 }

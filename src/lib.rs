@@ -16,7 +16,8 @@
 //!
 //! ## Why this is verifiable at all
 //!
-//! **Fuel bounds the dispatch loop**, and fuel is capped at [`MAX_FUEL`], so
+//! **Step fuel bounds the dispatch loop**, and it is capped at
+//! [`MAX_STEP_FUEL`], so
 //! the trip count is a compile-time constant no matter what the program's
 //! control flow does. The plan's objection — *"Kani cannot prove an
 //! interpreter's dispatch loop safe for all executions"* — is about an
@@ -31,10 +32,11 @@
 //!
 //! ## Status
 //!
-//! All six properties discharged by bounded model checking (Kani): single-step
+//! All seven properties discharged by bounded model checking (Kani): single-step
 //! memory safety (V1), capability-index confinement (V2), jump-target containment
 //! (V3), forward-only rejection (V3b), checked memory access (V4), and termination
-//! under fuel (V5). Each harness in `proofs.rs` states its `unwind` bound. Those
+//! under fuel (V5), plus precharge-before-capability ordering (V6). Each harness
+//! in `proofs.rs` states its `unwind` bound. Those
 //! bounds are shallow by design: the properties are structural, not depth-
 //! sensitive -- V1 quantifies over a fully symbolic instruction from the VM's
 //! concrete reset state, and the dispatch
@@ -44,6 +46,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod costs;
 pub mod isa;
 pub mod loader;
 
@@ -73,14 +76,13 @@ use isa::*;
 pub const MEM_LEN: usize = 512;
 /// Maximum program length.
 pub const MAX_INSNS: usize = 512;
-/// Fuel: the **ceiling** on how many instructions one run may execute, and
+/// Step fuel: the **ceiling** on how many instructions one run may execute, and
 /// therefore the dispatch loop's bound.
 ///
-/// This is what bounds the loop — not the program length. [`Vm::run`] takes the
-/// caller's fuel and clamps it to this value, so the trip count is a
-/// compile-time constant no matter what a caller passes, which is what keeps
-/// the dispatch loop verifiable. The proofs assume small fuel and are
-/// independent of its value.
+/// This is what bounds the loop — not the program length. [`StepFuel::new`]
+/// clamps the caller's request to this value, so the trip count is a
+/// compile-time constant no matter what a caller supplies. The proofs use
+/// smaller values and are independent of the constant's particular value.
 ///
 /// **A ceiling is not a tick's allowance, and the two must not be conflated.**
 /// The operating budget is whatever the caller hands to `run` beneath this
@@ -89,20 +91,16 @@ pub const MAX_INSNS: usize = 512;
 /// - The red-team board hands out the full 1024, deliberately generous so an
 ///   attacker has room to build something sophisticated rather than being cut
 ///   short. A range that starves its attackers proves nothing.
-/// - A real control tick hands out far less. Measured against the pilot core's
-///   register-transfer description at 230.5 cycles a dispatch, a 2 ms tick at
-///   25 MHz affords about 216 interpreted instructions with the tick to itself,
-///   and **159** once the envelope monitor has taken its 13,218 cycles. That
-///   remainder is the order a 500 Hz product budget sits at; at 250 Hz it is
-///   376. An earlier version of this comment said 223, which divided the whole
-///   tick by a dispatch cost measured on a different cache configuration and
-///   left the monitor's share out of the answer.
+/// - A real control tick also supplies target-specific [`TickCredits`]. The
+///   interpreter reserves the complete instruction charge before execution.
+///   The initial table is provisional NEORV32 RTL characterization; production
+///   admission remains disabled until deployed capability paths are bounded
+///   and an independent privileged deadline mechanism is integrated.
 ///
-/// This comment used to read "it is both the operating budget a tick hands out
-/// and the hard ceiling", which is what a careful reader trips over: it invites
-/// the inference that 1024 instructions fit inside a control period. They do
-/// not, and nothing here ever claimed they had to. Corrected 2026-08-07.
-pub const MAX_FUEL: u32 = 1024;
+/// Historical instructions-per-period divisions are not admission limits:
+/// instruction mix, capability implementations and shared monitor work all
+/// affect the actual cycle budget.
+pub const MAX_STEP_FUEL: u32 = 1024;
 /// Capability slots. Three: read state, propose setpoint, request signature.
 pub const N_CAPS: usize = 3;
 
@@ -115,7 +113,10 @@ pub const N_CAPS: usize = 3;
 pub enum Halt {
     /// `exit` reached. `r0` carries the program's result.
     Exit(u32),
-    FuelExhausted,
+    StepFuelExhausted,
+    /// The target-specific conservative execution-credit budget could not pay
+    /// for the next instruction. The instruction was not executed.
+    TickCreditsExhausted,
     PcOutOfRange,
     IllegalOpcode,
     MemBounds,
@@ -136,11 +137,204 @@ pub trait Caps {
     fn call(&mut self, idx: u32, args: [u32; 5]) -> u32;
 }
 
+/// Platform-independent bound on dispatched instructions.
+///
+/// Construction clamps the value to [`MAX_STEP_FUEL`], preserving the static
+/// dispatch-loop bound even when a caller supplies an untrusted number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StepFuel(u32);
+
+impl StepFuel {
+    pub const fn new(steps: u32) -> Self {
+        Self(if steps > MAX_STEP_FUEL {
+            MAX_STEP_FUEL
+        } else {
+            steps
+        })
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Target-specific conservative work allowance. Credits are deliberately a
+/// different type from [`StepFuel`]: a proof ceiling must not be passed where
+/// a control-tick timing allowance is required.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TickCredits(u32);
+
+impl TickCredits {
+    pub const fn new(credits: u32) -> Self {
+        Self(credits)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Both independent limits required for one invocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExecutionBudget {
+    pub step_fuel: StepFuel,
+    pub tick_credits: TickCredits,
+}
+
+impl ExecutionBudget {
+    pub const fn new(step_fuel: StepFuel, tick_credits: TickCredits) -> Self {
+        Self {
+            step_fuel,
+            tick_credits,
+        }
+    }
+}
+
+/// Versioned conservative costs for one concrete target configuration.
+///
+/// Values are absolute charges for one dispatch, including common dispatch
+/// overhead. Capability entries include the complete bounded callee cost. The
+/// model is deterministic: charges depend only on the encoded instruction,
+/// never on a host cycle counter or runtime operand values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CostModel {
+    pub version: u32,
+    run_overhead: u32,
+    alu: u32,
+    mul: u32,
+    load: [u32; 3],
+    store: [u32; 3],
+    branch: u32,
+    call: [u32; N_CAPS],
+    exit: u32,
+    invalid: u32,
+}
+
+impl CostModel {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        version: u32,
+        run_overhead: u32,
+        alu: u32,
+        mul: u32,
+        load: [u32; 3],
+        store: [u32; 3],
+        branch: u32,
+        call: [u32; N_CAPS],
+        exit: u32,
+        invalid: u32,
+    ) -> Self {
+        assert!(run_overhead > 0 && alu > 0 && mul > 0 && branch > 0 && exit > 0 && invalid > 0);
+        assert!(load[0] > 0 && load[1] > 0 && load[2] > 0);
+        assert!(store[0] > 0 && store[1] > 0 && store[2] > 0);
+        assert!(call[0] > 0 && call[1] > 0 && call[2] > 0);
+        Self {
+            version,
+            run_overhead,
+            alu,
+            mul,
+            load,
+            store,
+            branch,
+            call,
+            exit,
+            invalid,
+        }
+    }
+
+    /// A model useful for functional tests and timing characterization. It is
+    /// not a deployment timing model.
+    pub const fn uniform(charge: u32) -> Self {
+        assert!(charge > 0);
+        Self::new(
+            0,
+            charge,
+            charge,
+            charge,
+            [charge; 3],
+            [charge; 3],
+            charge,
+            [charge; N_CAPS],
+            charge,
+            charge,
+        )
+    }
+
+    pub const fn run_overhead(&self) -> u32 {
+        self.run_overhead
+    }
+
+    /// Conservative charge for an encoded instruction.
+    pub const fn charge(&self, i: &Insn) -> u32 {
+        if !admitted(i.opcode) {
+            return self.invalid;
+        }
+        let class = i.opcode & 0x07;
+        let op = i.opcode & 0xf0;
+        match class {
+            CLASS_ALU => {
+                if op == ALU_MUL {
+                    self.mul
+                } else {
+                    self.alu
+                }
+            }
+            CLASS_LDX => self.load[width_index(i.opcode)],
+            CLASS_ST | CLASS_STX => self.store[width_index(i.opcode)],
+            CLASS_JMP => {
+                if op == JMP_CALL {
+                    let idx = i.imm as u32;
+                    if idx < N_CAPS as u32 {
+                        self.call[idx as usize]
+                    } else {
+                        self.invalid
+                    }
+                } else if op == JMP_EXIT {
+                    self.exit
+                } else {
+                    self.branch
+                }
+            }
+            _ => self.invalid,
+        }
+    }
+}
+
+const fn width_index(opcode: u8) -> usize {
+    match opcode & 0x18 {
+        SIZE_B => 0,
+        SIZE_H => 1,
+        _ => 2,
+    }
+}
+
+/// Accounting returned with every halt, including abnormal halts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RunOutcome {
+    pub halt: Halt,
+    pub steps_used: u32,
+    pub credits_used: u32,
+}
+
+/// Explicitly non-deployment helpers for functional tests and cycle
+/// characterization. Keeping these under a conspicuous module prevents a
+/// unit-cost model from looking like the target's operational cost table.
+pub mod characterization {
+    use super::{CostModel, ExecutionBudget, StepFuel, TickCredits};
+
+    pub const COSTS: CostModel = CostModel::uniform(1);
+
+    pub const fn budget(steps: StepFuel) -> ExecutionBudget {
+        ExecutionBudget::new(steps, TickCredits::new(u32::MAX))
+    }
+}
+
 /// Machine state. No heap, no growth, no interior mutability.
 pub struct Vm {
     regs: [u32; N_REGS],
     mem: [u8; MEM_LEN],
-    fuel: u32,
+    step_fuel: u32,
+    tick_credits: u32,
 }
 
 impl Default for Vm {
@@ -154,7 +348,8 @@ impl Vm {
         Vm {
             regs: [0; N_REGS],
             mem: [0; MEM_LEN],
-            fuel: 0,
+            step_fuel: 0,
+            tick_credits: 0,
         }
     }
 
@@ -182,25 +377,45 @@ impl Vm {
     /// IR semantics §7 requires setpoints to be double-buffered and committed
     /// only on a clean `EXIT`, with every other halt degrading to STO/SS1
     /// rather than hold-last.
-    pub fn run<C: Caps>(&mut self, insns: &[Insn], fuel: u32, caps: &mut C) -> Halt {
+    pub fn run<C: Caps>(
+        &mut self,
+        insns: &[Insn],
+        budget: ExecutionBudget,
+        costs: &CostModel,
+        caps: &mut C,
+    ) -> RunOutcome {
+        // Reset is part of the fixed invocation overhead. It happens even for
+        // a configuration-error budget so stale registers from a prior run
+        // cannot be mistaken for this invocation's result.
         self.regs = [0; N_REGS];
         self.regs[REG_FP as usize] = MEM_LEN as u32;
-        self.fuel = fuel;
-
-        // Fuel is the termination argument and the loop bound. Capping it
-        // here means the trip count is a compile-time constant regardless of
-        // what the program's control flow does.
-        if self.fuel > MAX_FUEL {
-            self.fuel = MAX_FUEL;
+        self.step_fuel = budget.step_fuel.get();
+        self.tick_credits = budget.tick_credits.get();
+        let initial_steps = self.step_fuel;
+        let initial_credits = self.tick_credits;
+        if self.tick_credits < costs.run_overhead() {
+            return RunOutcome {
+                halt: Halt::TickCreditsExhausted,
+                steps_used: 0,
+                credits_used: 0,
+            };
         }
+        self.tick_credits -= costs.run_overhead();
         let mut pc: usize = 0;
-        while self.fuel > 0 {
-            self.fuel -= 1;
+        while self.step_fuel > 0 {
             if pc >= insns.len() {
-                return Halt::PcOutOfRange;
+                return self.outcome(Halt::PcOutOfRange, initial_steps, initial_credits);
             }
+            let charge = costs.charge(&insns[pc]);
+            if self.tick_credits < charge {
+                return self.outcome(Halt::TickCreditsExhausted, initial_steps, initial_credits);
+            }
+            // Reserve both budgets before the instruction can mutate VM state
+            // or enter a capability implementation.
+            self.step_fuel -= 1;
+            self.tick_credits -= charge;
             match self.step(&insns[pc], &mut pc, caps) {
-                Some(h) => return h,
+                Some(h) => return self.outcome(h, initial_steps, initial_credits),
                 None => {}
             }
         }
@@ -210,7 +425,15 @@ impl Vm {
         // hold-last. That is what makes an attacker-timed abort safe, and it
         // is why admitting loops does not reintroduce the torn-state problem:
         // a program cut off mid-flight has committed nothing.
-        Halt::FuelExhausted
+        self.outcome(Halt::StepFuelExhausted, initial_steps, initial_credits)
+    }
+
+    fn outcome(&self, halt: Halt, initial_steps: u32, initial_credits: u32) -> RunOutcome {
+        RunOutcome {
+            halt,
+            steps_used: initial_steps - self.step_fuel,
+            credits_used: initial_credits - self.tick_credits,
+        }
     }
 
     /// One instruction. Returns `Some(halt)` to stop, `None` to continue.
@@ -236,7 +459,11 @@ impl Vm {
                     return Some(Halt::WriteToFp);
                 }
                 let a = self.regs[dst];
-                let b = if src_is_reg { self.regs[srcr] } else { i.imm as u32 };
+                let b = if src_is_reg {
+                    self.regs[srcr]
+                } else {
+                    i.imm as u32
+                };
                 let v = match op {
                     ALU_ADD => a.wrapping_add(b),
                     ALU_SUB => a.wrapping_sub(b),
@@ -280,7 +507,11 @@ impl Vm {
             }
             CLASS_ST | CLASS_STX => {
                 let addr = self.regs[dst].wrapping_add(i.off as i32 as u32);
-                let v = if class == CLASS_STX { self.regs[srcr] } else { i.imm as u32 };
+                let v = if class == CLASS_STX {
+                    self.regs[srcr]
+                } else {
+                    i.imm as u32
+                };
                 match self.store(addr, v, i.opcode & 0x18) {
                     Ok(()) => {
                         *pc += 1;
@@ -298,7 +529,11 @@ impl Vm {
                             return Some(Halt::BadCapIndex);
                         }
                         let args = [
-                            self.regs[1], self.regs[2], self.regs[3], self.regs[4], self.regs[5],
+                            self.regs[1],
+                            self.regs[2],
+                            self.regs[3],
+                            self.regs[4],
+                            self.regs[5],
                         ];
                         self.regs[0] = caps.call(idx, args);
                         *pc += 1;
@@ -307,7 +542,11 @@ impl Vm {
                     _ => {}
                 }
                 let a = self.regs[dst];
-                let b = if src_is_reg { self.regs[srcr] } else { i.imm as u32 };
+                let b = if src_is_reg {
+                    self.regs[srcr]
+                } else {
+                    i.imm as u32
+                };
                 let taken = match op {
                     JMP_JA => true,
                     JMP_JEQ => a == b,

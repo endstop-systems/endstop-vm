@@ -17,7 +17,9 @@
 
 use endstop_vm::isa::{self, *};
 use endstop_vm::loader::{validate, Reject};
-use endstop_vm::{Caps, Halt, Vm, MAX_FUEL, MEM_LEN, N_CAPS};
+use endstop_vm::{Caps, CostModel, ExecutionBudget, Halt, TickCredits, Vm, MAX_STEP_FUEL, MEM_LEN, N_CAPS};
+
+const FUNCTIONAL_COSTS: CostModel = CostModel::uniform(1);
 
 
 /// Local instruction constructor. The library keeps its own as a test helper
@@ -153,7 +155,12 @@ extern "C" fn main() -> ! {
         Ok(bound) => {
             let mut vm = Vm::new();
             let mut m = machine();
-            let halt = vm.run(&prog, bound.fuel(), &mut m);
+            let halt = vm.run(
+                &prog,
+                ExecutionBudget::new(bound.step_fuel(), TickCredits::new(u32::MAX)),
+                &FUNCTIONAL_COSTS,
+                &mut m,
+            ).halt;
             check(&mut bad, "a valid program loads and runs", matches!(halt, Halt::Exit(_)));
             check(&mut bad, "it read state and proposed 107", m.proposed == 107 && m.calls == 2);
         }
@@ -181,7 +188,12 @@ extern "C" fn main() -> ! {
             let mut vm = Vm::new();
             let mut m = machine();
             check(&mut bad, "an infinite loop halts on fuel",
-                  matches!(vm.run(&spin, f.fuel(), &mut m), Halt::FuelExhausted));
+                  matches!(vm.run(
+                      &spin,
+                      ExecutionBudget::new(f.step_fuel(), TickCredits::new(u32::MAX)),
+                      &FUNCTIONAL_COSTS,
+                      &mut m,
+                  ).halt, Halt::StepFuelExhausted));
         }
         Err(_) => check(&mut bad, "an infinite loop halts on fuel", false),
     }
@@ -197,7 +209,12 @@ extern "C" fn main() -> ! {
             let mut vm = Vm::new();
             let mut m = machine();
             check(&mut bad, "a read past the region halts",
-                  matches!(vm.run(&oob, f.fuel(), &mut m), Halt::MemBounds));
+                  matches!(vm.run(
+                      &oob,
+                      ExecutionBudget::new(f.step_fuel(), TickCredits::new(u32::MAX)),
+                      &FUNCTIONAL_COSTS,
+                      &mut m,
+                  ).halt, Halt::MemBounds));
         }
         Err(_) => check(&mut bad, "a read past the region halts", false),
     }
@@ -206,7 +223,7 @@ extern "C" fn main() -> ! {
     say("failures ");
     num(bad);
     say("\nfuel cap ");
-    num(MAX_FUEL);
+    num(MAX_STEP_FUEL);
     say(", memory ");
     num(MEM_LEN as u32);
     say(" bytes, capabilities ");
